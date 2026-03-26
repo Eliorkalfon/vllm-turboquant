@@ -1,0 +1,5 @@
+Summarize the purpose of transformer KV cache in two sentences.
+Write three bullet points about memory bandwidth bottlenecks in LLM inference.
+Explain why long-context decoding becomes expensive as sequence length grows.
+Describe the difference between keys and values in self-attention.
+Give a short paragraph about quantization tradeoffs for inference latency and quality.
