@@ -18,7 +18,8 @@ def main():
     print(f"Fetching config for {args.model} (this only downloads a tiny config.json)...")
     head_size, num_kv_heads, num_hidden_layers, layer_types, _ = _derive_model_shape(args.model, trust_remote_code=args.trust_remote_code)
     
-    layer_indices = _resolve_layer_indices(num_hidden_layers, layer_types)
+    # Ignore strict layer type filtering. For dummy/fallback inference, generate keys for all layers.
+    layer_indices = range(num_hidden_layers)
     layer_names = [args.layer_pattern.format(i=idx) for idx in layer_indices]
 
     print(f"Found {num_hidden_layers} layers, {num_kv_heads} KV heads, and head size {head_size}.")
