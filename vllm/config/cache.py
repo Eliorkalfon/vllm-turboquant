@@ -92,7 +92,7 @@ class CacheConfig:
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
     enable_turboquant: bool = False
-    """Enable the GB10-only TurboQuant KV cache (requires NVIDIA GB10 / SM121)."""
+    """Enable the TurboQuant KV cache (requires NVIDIA GB10 / SM121 or H100 / SM90)."""
     turboquant_metadata_path: str | None = None
     """Optional path to the TurboQuant per-layer metadata JSON artifact.
     If unset, vLLM looks for `turboquant_kv.json` under the local model path."""
@@ -238,7 +238,7 @@ class CacheConfig:
         elif cache_dtype.startswith("turboquant"):
             logger.warning(
                 "Using TurboQuant KV cache with the Triton attention backend "
-                "(requires NVIDIA GB10 / SM121)."
+                "(requires NVIDIA GB10 / SM121 or H100 / SM90)."
             )
         return cache_dtype
 
@@ -258,6 +258,6 @@ class CacheConfig:
             raise ValueError("TurboQuant KV cache requires CUDA.")
 
         capability = current_platform.get_device_capability()
-        if capability is None or (capability.major, capability.minor) != (12, 1):
-            raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+        if capability is None or (capability.major, capability.minor) not in ((12, 1), (9, 0)):
+            raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121 or H100 / SM90.")
         return self
