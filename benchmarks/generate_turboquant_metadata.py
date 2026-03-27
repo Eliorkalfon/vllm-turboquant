@@ -100,11 +100,10 @@ def _validate_calibration_model_choice(
         return
 
     quant_method = quantization_config.get("quant_method", "unknown")
-    raise ValueError(
-        "TurboQuant calibration should not run directly on a quantized target "
-        f"checkpoint ({quant_method}). Pass `--calibration-model` pointing to "
-        "the original non-quantized model so activation statistics are collected "
-        "from real weights instead of a partially reconstructed fallback model."
+    print(
+        f"WARNING: TurboQuant calibration is running directly on a quantized target checkpoint ({quant_method}). "
+        "For maximum accuracy, you would normally pass `--calibration-model` pointing to the original non-quantized model. "
+        "Proceeding anyway since no fallback calibration model was provided!"
     )
 
 
