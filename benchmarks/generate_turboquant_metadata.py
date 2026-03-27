@@ -171,6 +171,7 @@ def _load_calibration_model(
                 torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code,
                 low_cpu_mem_usage=True,
+                device_map="auto",
             )
         except (KeyError, ValueError) as e:
             errors.append(f"{loader.__name__}: {e}")
@@ -335,7 +336,6 @@ def _collect_activation_channel_scores(
         trust_remote_code=trust_remote_code,
         torch_dtype=model_torch_dtype,
     )
-    model.to(model_device)
     model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
