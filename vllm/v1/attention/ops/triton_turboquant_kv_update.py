@@ -48,8 +48,8 @@ def _require_gb10_cuda(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError("TurboQuant Triton KV update requires CUDA tensors.")
     capability = torch.cuda.get_device_capability(device)
-    if capability != (12, 1):
-        raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+    if capability not in ((12, 1), (9, 0)):
+        raise ValueError("TurboQuant KV cache requires NVIDIA GB10 / SM121 or H100 / SM90.")
 
 
 @triton.jit

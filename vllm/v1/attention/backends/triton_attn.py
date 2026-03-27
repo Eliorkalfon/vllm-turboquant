@@ -73,6 +73,7 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 GB10_CAPABILITY = DeviceCapability(12, 1)
+H100_CAPABILITY = DeviceCapability(9, 0)
 # The Triton prefill kernel already handles power-of-two head sizes up to 256.
 # Keep TurboQuant prefill on that kernel for common Qwen 27B/35B-class models
 # instead of dropping to the slow Python fallback on the first prompt.
@@ -452,8 +453,8 @@ class TritonAttentionBackend(AttentionBackend):
             return None
         if not current_platform.is_cuda():
             return "TurboQuant KV cache requires CUDA"
-        if device_capability != GB10_CAPABILITY:
-            return "TurboQuant KV cache requires NVIDIA GB10 / SM121"
+        if device_capability not in (GB10_CAPABILITY, H100_CAPABILITY):
+            return "TurboQuant KV cache requires NVIDIA GB10 / SM121 or H100 / SM90"
         return None
 
 
@@ -565,8 +566,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         if self.turboquant_bits is not None:
             capability = current_platform.get_device_capability()
-            if not current_platform.is_cuda() or capability != GB10_CAPABILITY:
-                raise RuntimeError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+            if not current_platform.is_cuda() or capability not in (GB10_CAPABILITY, H100_CAPABILITY):
+                raise RuntimeError("TurboQuant KV cache requires NVIDIA GB10 / SM121 or H100 / SM90.")
             if turboquant_layer_name is None:
                 raise ValueError(
                     "TurboQuant KV cache requires the attention layer name for "
@@ -670,8 +671,8 @@ class TritonAttentionImpl(AttentionImpl):
     def _validate_turboquant_device(self, device: torch.device) -> None:
         if device.type != "cuda":
             raise RuntimeError("TurboQuant KV cache requires CUDA.")
-        if torch.cuda.get_device_capability(device) != (12, 1):
-            raise RuntimeError("TurboQuant KV cache requires NVIDIA GB10 / SM121.")
+        if torch.cuda.get_device_capability(device) not in ((12, 1), (9, 0)):
+            raise RuntimeError("TurboQuant KV cache requires NVIDIA GB10 / SM121 or H100 / SM90.")
 
     def _get_turboquant_update_tables(
         self,
