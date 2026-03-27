@@ -118,11 +118,15 @@ def _resolve_layer_indices(
         raise ValueError(
             "Model config layer_types length does not match num_hidden_layers."
         )
-    return [
+    indices = [
         layer_idx
         for layer_idx, layer_type in enumerate(layer_types)
         if layer_type == "full_attention"
     ]
+    # Fallback for custom architectures like GptOss which don't use the "full_attention" identifier
+    if not indices:
+        indices = list(range(num_hidden_layers))
+    return indices
 
 
 def _resolve_torch_dtype(dtype: str) -> torch.dtype | str:
