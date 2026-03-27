@@ -10,7 +10,17 @@ from pathlib import Path
 
 import regex as re
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # pragma: no cover - depends on transformers version
+    AutoModelForImageTextToText = None
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - depends on transformers version
+    AutoModelForVision2Seq = None
 
 from vllm.transformers_utils.config import get_config
 from vllm.v1.attention.ops.turboquant_kv_cache import get_turboquant_outlier_count
@@ -39,7 +49,7 @@ def _derive_model_shape(
     model: str,
     *,
     trust_remote_code: bool = False,
-) -> tuple[int, int, int, tuple[str, ...] | None]:
+) -> tuple[int, int, int, tuple[str, ...] | None, dict | None]:
     config = get_config(model, trust_remote_code=trust_remote_code)
     text_config = getattr(config, "text_config", None)
     source = text_config if text_config is not None else config
@@ -62,7 +72,40 @@ def _derive_model_shape(
     layer_types = getattr(source, "layer_types", None)
     if layer_types is not None:
         layer_types = tuple(layer_types)
-    return head_size, num_kv_heads, num_hidden_layers, layer_types
+    quantization_config = getattr(config, "quantization_config", None)
+    if quantization_config is None and text_config is not None:
+        quantization_config = getattr(text_config, "quantization_config", None)
+    return (
+        head_size,
+        num_kv_heads,
+        num_hidden_layers,
+        layer_types,
+        quantization_config,
+    )
+
+
+def _is_quantized_model(quantization_config: dict | None) -> bool:
+    return isinstance(quantization_config, dict) and len(quantization_config) > 0
+
+
+def _validate_calibration_model_choice(
+    *,
+    target_model: str,
+    calibration_model: str,
+    quantization_config: dict | None,
+) -> None:
+    if calibration_model != target_model:
+        return
+    if not _is_quantized_model(quantization_config):
+        return
+
+    quant_method = quantization_config.get("quant_method", "unknown")
+    raise ValueError(
+        "TurboQuant calibration should not run directly on a quantized target "
+        f"checkpoint ({quant_method}). Pass `--calibration-model` pointing to "
+        "the original non-quantized model so activation statistics are collected "
+        "from real weights instead of a partially reconstructed fallback model."
+    )
 
 
 def _resolve_layer_indices(
@@ -100,6 +143,41 @@ def _resolve_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+def _load_calibration_model(
+    model_name_or_path: str,
+    *,
+    torch_dtype: torch.dtype | str,
+    trust_remote_code: bool,
+):
+    model_loaders = [
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        AutoModelForVision2Seq,
+        AutoModel,
+    ]
+    errors: list[str] = []
+
+    for loader in model_loaders:
+        if loader is None:
+            continue
+        try:
+            return loader.from_pretrained(
+                model_name_or_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=trust_remote_code,
+                low_cpu_mem_usage=True,
+            )
+        except (KeyError, ValueError) as e:
+            errors.append(f"{loader.__name__}: {e}")
+
+    raise ValueError(
+        "Unable to load the calibration model with the installed transformers "
+        "build. This usually means the checkpoint architecture is newer than "
+        "your local transformers version. Upgrade transformers, then rerun. "
+        f"Loader errors: {' | '.join(errors)}"
+    )
 
 
 def _ensure_padding_token(tokenizer) -> None:
@@ -249,10 +327,10 @@ def _collect_activation_channel_scores(
 ) -> tuple[dict[tuple[int, str], torch.Tensor], int]:
     model_device = _resolve_device(device)
     model_torch_dtype = _resolve_torch_dtype(dtype)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = _load_calibration_model(
         model_name_or_path,
-        torch_dtype=model_torch_dtype,
         trust_remote_code=trust_remote_code,
+        torch_dtype=model_torch_dtype,
     )
     model.to(model_device)
     model.eval()
@@ -352,6 +430,13 @@ def main() -> None:
         "--model", required=True, help="Local model path or HF model id."
     )
     parser.add_argument(
+        "--calibration-model",
+        help=(
+            "Optional local model path or HF model id used only for calibration. "
+            "Required when --model points to a quantized checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--kv-cache-dtype",
         choices=("turboquant25", "turboquant35"),
         required=True,
@@ -373,7 +458,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer-pattern",
-        default="model.layers.{i}.self_attn",
+        default="model.layers.{i}.self_attn.attn",
         help="Layer-name pattern used to populate metadata keys.",
     )
     parser.add_argument(
@@ -416,13 +501,25 @@ def main() -> None:
 
     prompts = _load_prompts(args.prompts_file)[: args.max_prompts]
     prompts_sha256 = hashlib.sha256("\n".join(prompts).encode("utf-8")).hexdigest()
-    head_size, num_kv_heads, num_hidden_layers, layer_types = _derive_model_shape(
+    (
+        head_size,
+        num_kv_heads,
+        num_hidden_layers,
+        layer_types,
+        quantization_config,
+    ) = _derive_model_shape(
         args.model,
         trust_remote_code=args.trust_remote_code,
     )
+    calibration_model = args.calibration_model or args.model
+    _validate_calibration_model_choice(
+        target_model=args.model,
+        calibration_model=calibration_model,
+        quantization_config=quantization_config,
+    )
     required_layer_indices = _resolve_layer_indices(num_hidden_layers, layer_types)
     calibration_scores, num_observed_tokens = _collect_activation_channel_scores(
-        model_name_or_path=args.model,
+        model_name_or_path=calibration_model,
         prompts=prompts,
         required_layer_indices=required_layer_indices,
         num_kv_heads=num_kv_heads,

@@ -59,6 +59,7 @@ from vllm.v1.attention.ops.turboquant_kv_cache import (
     is_turboquant_kv_cache,
 )
 from vllm.v1.attention.ops.turboquant_metadata import (
+    TurboQuantLayerMetadata,
     TurboQuantMetadata,
     discover_turboquant_metadata_path,
     load_turboquant_metadata,
@@ -72,7 +73,10 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 GB10_CAPABILITY = DeviceCapability(12, 1)
-TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE = 128
+# The Triton prefill kernel already handles power-of-two head sizes up to 256.
+# Keep TurboQuant prefill on that kernel for common Qwen 27B/35B-class models
+# instead of dropping to the slow Python fallback on the first prompt.
+TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE = 256
 
 
 @dataclass
@@ -547,6 +551,7 @@ class TritonAttentionImpl(AttentionImpl):
         ] = {}
         self._turboquant_metadata = turboquant_metadata
         self._turboquant_layer_name = turboquant_layer_name
+        self._turboquant_layer_metadata: TurboQuantLayerMetadata | None = None
 
         self.sinks = sinks
         if sinks is not None:
@@ -597,6 +602,7 @@ class TritonAttentionImpl(AttentionImpl):
                     f"{self._turboquant_metadata.head_size} vs {self.head_size}."
                 )
             layer_metadata = self._turboquant_metadata.get_layer(turboquant_layer_name)
+            self._turboquant_layer_metadata = layer_metadata
             if len(layer_metadata.key.high_precision_indices) != self.num_kv_heads:
                 raise ValueError(
                     "TurboQuant metadata key KV head count does not match layer: "
@@ -746,18 +752,15 @@ class TritonAttentionImpl(AttentionImpl):
         masks = self._turboquant_masks.get(cache_key)
         if masks is not None:
             return masks
-        if self._turboquant_metadata is None or self._turboquant_layer_name is None:
+        if self._turboquant_layer_metadata is None:
             raise RuntimeError("TurboQuant metadata is not initialized.")
-        layer_metadata = self._turboquant_metadata.get_layer(
-            self._turboquant_layer_name
-        )
         masks = (
-            layer_metadata.key.get_group_indices(
+            self._turboquant_layer_metadata.key.get_group_indices(
                 device=device,
                 head_size=self.head_size,
                 kv_cache_dtype=self.kv_cache_dtype,
             ),
-            layer_metadata.value.get_group_indices(
+            self._turboquant_layer_metadata.value.get_group_indices(
                 device=device,
                 head_size=self.head_size,
                 kv_cache_dtype=self.kv_cache_dtype,
@@ -1113,9 +1116,10 @@ class TritonAttentionImpl(AttentionImpl):
         )
 
     def fused_rope_kvcache_supported(self):
-        return rocm_aiter_ops.is_enabled() or is_turboquant_kv_cache(
-            self.kv_cache_dtype
-        )
+        # TurboQuant still applies RoPE in PyTorch and then performs the fused
+        # quantize-and-store KV update. Do not advertise RoPE+KV fusion support
+        # until a real fused TurboQuant kernel exists.
+        return rocm_aiter_ops.is_enabled()
 
     def do_rope_and_kv_cache_update(
         self,
@@ -1134,7 +1138,7 @@ class TritonAttentionImpl(AttentionImpl):
         if is_turboquant_kv_cache(self.kv_cache_dtype):
             rotary_dtype = query.dtype
             rotary_cache = cos_sin_cache.to(query.device, dtype=rotary_dtype)
-            rotary_dim = rotary_cache.shape[-1] // 2
+            rotary_dim = rotary_cache.shape[-1]
             rotated_query, rotated_key = RotaryEmbedding.forward_static(
                 positions=positions,
                 query=query,
@@ -1278,6 +1282,29 @@ class TritonAttentionImpl(AttentionImpl):
 
         return output
 
+    def _can_use_turboquant_dense_prefill(
+        self,
+        query: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> bool:
+        if (
+            not attn_metadata.causal
+            or attn_metadata.use_cascade
+            or self.logits_soft_cap != 0
+            or attn_metadata.mm_prefix_range is not None
+            or self.sinks is not None
+            or query.shape[-1] > TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE
+        ):
+            return False
+
+        if attn_metadata.max_query_len != attn_metadata.max_seq_len:
+            return False
+
+        query_lens_cpu = (
+            attn_metadata.query_start_loc_cpu[1:] - attn_metadata.query_start_loc_cpu[:-1]
+        )
+        return torch.equal(query_lens_cpu, attn_metadata.seq_lens_cpu)
+
     def _forward_turboquant(
         self,
         query: torch.Tensor,
@@ -1288,35 +1315,35 @@ class TritonAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
     ) -> torch.Tensor:
+        # Pure prompt-prefill batches do not need to read back quantized KV from
+        # cache. Reuse the dense Triton prefill kernel so first-token latency is
+        # dominated by attention work instead of TurboQuant decode setup.
+        if self._can_use_turboquant_dense_prefill(query, attn_metadata):
+            context_attention_fwd(
+                q=query,
+                k=key,
+                v=value,
+                o=output,
+                b_start_loc=attn_metadata.query_start_loc,
+                b_seq_len=attn_metadata.seq_lens,
+                max_input_len=attn_metadata.max_query_len,
+                is_causal=attn_metadata.causal,
+                softmax_scale=self.scale,
+                sliding_window_q=self.sliding_window[0],
+                sliding_window_k=self.sliding_window[1],
+            )
+            return output
+
         if key_cache.numel() == 0 or value_cache.numel() == 0:
-            if (
-                attn_metadata.causal
-                and self.logits_soft_cap == 0
-                and attn_metadata.mm_prefix_range is None
-                and self.sinks is None
-                and query.shape[-1] <= TURBOQUANT_TRITON_PREFILL_MAX_HEAD_SIZE
-            ):
-                context_attention_fwd(
-                    q=query,
-                    k=key,
-                    v=value,
-                    o=output,
-                    b_start_loc=attn_metadata.query_start_loc,
-                    b_seq_len=attn_metadata.seq_lens,
-                    max_input_len=attn_metadata.max_query_len,
-                    is_causal=attn_metadata.causal,
-                    softmax_scale=self.scale,
-                    sliding_window_q=self.sliding_window[0],
-                    sliding_window_k=self.sliding_window[1],
-                )
-            else:
-                self._fallback_turboquant_attention(
-                    query=query,
-                    key=key,
-                    value=value,
-                    output=output,
-                    attn_metadata=attn_metadata,
-                )
+            # TurboQuant-native prefill is not implemented yet. When there is no
+            # KV cache backing tensor, fall back to an eager live-K/V reference.
+            self._fallback_turboquant_attention(
+                query=query,
+                key=key,
+                value=value,
+                output=output,
+                attn_metadata=attn_metadata,
+            )
             return output
 
         assert self.turboquant_bits is not None

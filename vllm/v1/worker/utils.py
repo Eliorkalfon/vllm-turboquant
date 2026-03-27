@@ -409,6 +409,9 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
         init_snapshot.total_memory * cache_config.gpu_memory_utilization
     )
 
+    if cache_config.kv_cache_memory_bytes is not None:
+        return requested_memory
+
     if init_snapshot.free_memory < requested_memory:
         max_utilization = 0.0
         if init_snapshot.total_memory > 0:
@@ -426,7 +429,7 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
             f"For this startup snapshot, the largest utilization that fits is "
             f"approximately {max_utilization:.4f} "
             f"(`--gpu-memory-utilization {max_utilization:.4f}`), or set "
-            f"`--kv-cache-memory {init_snapshot.free_memory}` "
+            f"`--kv-cache-memory-bytes {init_snapshot.free_memory}` "
             f"({format_gib(init_snapshot.free_memory)} GiB) for manual control."
         )
 

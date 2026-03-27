@@ -5,7 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+from vllm.platforms import current_platform
+from vllm.v1.attention.ops.triton_prefill_attention import (
+    context_attention_fwd,
+    get_block_size,
+)
 
 
 def ref_masked_attention(
@@ -70,6 +74,19 @@ def ref_masked_attention(
     output = output.transpose(1, 2).squeeze(0)
 
     return output
+
+
+def test_get_block_size_uses_smaller_tile_for_gb10_head_dim_256(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(current_platform, "has_device_capability", lambda cap: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: (12, 1),
+    )
+
+    assert get_block_size(torch.bfloat16, 256, torch.device("cuda")) == 64
+    assert get_block_size(torch.bfloat16, 128, torch.device("cuda")) == 128
 
 
 @pytest.mark.parametrize("B", [5])

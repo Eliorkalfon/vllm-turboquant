@@ -39,9 +39,7 @@ def _require_gb10_cuda(device: torch.device) -> None:
 @triton.jit
 def _apply_softcap(logits, softcap):
     scaled = logits / softcap
-    pos = tl.exp(scaled)
-    neg = tl.exp(-scaled)
-    return softcap * (pos - neg) / (pos + neg)
+    return softcap * (2 * tl.sigmoid(2 * scaled) - 1)
 
 
 @triton.jit
@@ -356,6 +354,8 @@ def _turboquant_decode_kernel(
             )
 
         logits = key_logits * softmax_scale
+        if USE_SOFTCAP:
+            logits = _apply_softcap(logits, softcap)
         valid_mask = mask_n
         if CAUSAL:
             valid_mask = valid_mask & (offs_n <= query_pos)
@@ -382,8 +382,6 @@ def _turboquant_decode_kernel(
                 )
                 valid_mask = valid_mask | (q_in_range & k_in_range)
         logits = tl.where(valid_mask, logits, float("-inf"))
-        if USE_SOFTCAP:
-            logits = _apply_softcap(logits, softcap)
 
         n_e_max = tl.maximum(tl.max(logits, axis=0), e_max)
         re_scale = tl.exp(e_max - n_e_max)

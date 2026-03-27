@@ -177,9 +177,23 @@ def _fwd_kernel(
     )
 
 
-def get_block_size(dtype: torch.dtype) -> int:
+def get_block_size(
+    dtype: torch.dtype,
+    head_dim: int | None = None,
+    device: torch.device | None = None,
+) -> int:
     if dtype == torch.float32:
         return 32
+    if (
+        head_dim is not None
+        and head_dim > 128
+        and device is not None
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) == (12, 1)
+    ):
+        # GB10 only exposes 101376 bytes of opt-in shared memory per block.
+        # BLOCK=128 with D=256 overflows that budget for this kernel shape.
+        return 64
     elif current_platform.is_cuda_alike() and current_platform.has_device_capability(
         80
     ):
@@ -207,7 +221,7 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
+    BLOCK = get_block_size(q.dtype, q.shape[-1], q.device)
 
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 

@@ -47,45 +47,64 @@ class TurboQuantTensorMetadata:
         head_size: int,
         kv_cache_dtype: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        outlier_count = _get_turboquant_outlier_count(head_size, kv_cache_dtype)
-        if len(self.high_precision_indices) == 0:
-            raise ValueError("TurboQuant metadata must contain at least one KV head.")
-
-        all_idx = torch.arange(head_size, dtype=torch.int64, device=device)
-        high_groups: list[torch.Tensor] = []
-        low_groups: list[torch.Tensor] = []
-        for head_idx, high_indices in enumerate(self.high_precision_indices):
-            if len(high_indices) != outlier_count:
-                raise ValueError(
-                    "TurboQuant metadata high-precision group size mismatch for "
-                    f"head {head_idx}: expected {outlier_count}, got "
-                    f"{len(high_indices)}."
-                )
-            high = torch.tensor(high_indices, dtype=torch.int64, device=device)
-            if torch.any(high[:-1] >= high[1:]):
-                raise ValueError(
-                    "TurboQuant metadata high-precision indices must be strictly "
-                    "sorted."
-                )
-            if high.min().item() < 0 or high.max().item() >= head_size:
-                raise ValueError(
-                    "TurboQuant metadata high-precision indices are out of range."
-                )
-            unique = torch.unique(high)
-            if unique.numel() != high.numel():
-                raise ValueError(
-                    "TurboQuant metadata high-precision indices must be unique."
-                )
-            low_mask = torch.ones(head_size, dtype=torch.bool, device=device)
-            low_mask.scatter_(0, high, False)
-            low = all_idx[low_mask]
-            high_groups.append(high)
-            low_groups.append(low)
-
-        return torch.stack(high_groups, dim=0), torch.stack(low_groups, dim=0)
+        high_cpu, low_cpu = _cached_group_indices(
+            self.high_precision_indices,
+            head_size,
+            kv_cache_dtype,
+        )
+        if device.type == "cpu":
+            return high_cpu, low_cpu
+        return high_cpu.to(device=device), low_cpu.to(device=device)
 
     def to_json(self) -> list[list[int]]:
         return [list(indices) for indices in self.high_precision_indices]
+
+
+@cache
+def _cached_group_indices(
+    high_precision_indices: tuple[tuple[int, ...], ...],
+    head_size: int,
+    kv_cache_dtype: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    outlier_count = _get_turboquant_outlier_count(head_size, kv_cache_dtype)
+    if len(high_precision_indices) == 0:
+        raise ValueError("TurboQuant metadata must contain at least one KV head.")
+
+    all_idx = torch.arange(head_size, dtype=torch.int64)
+    high_groups: list[torch.Tensor] = []
+    low_groups: list[torch.Tensor] = []
+    for head_idx, high_indices in enumerate(high_precision_indices):
+        if len(high_indices) != outlier_count:
+            raise ValueError(
+                "TurboQuant metadata high-precision group size mismatch for "
+                f"head {head_idx}: expected {outlier_count}, got "
+                f"{len(high_indices)}."
+            )
+        high = torch.tensor(high_indices, dtype=torch.int64)
+        if torch.any(high[:-1] >= high[1:]):
+            raise ValueError(
+                "TurboQuant metadata high-precision indices must be strictly "
+                "sorted."
+            )
+        if high.min().item() < 0 or high.max().item() >= head_size:
+            raise ValueError(
+                "TurboQuant metadata high-precision indices are out of range."
+            )
+        unique = torch.unique(high)
+        if unique.numel() != high.numel():
+            raise ValueError(
+                "TurboQuant metadata high-precision indices must be unique."
+            )
+        low_mask = torch.ones(head_size, dtype=torch.bool)
+        low_mask.scatter_(0, high, False)
+        low = all_idx[low_mask]
+        high_groups.append(high)
+        low_groups.append(low)
+
+    return (
+        torch.stack(high_groups, dim=0).contiguous(),
+        torch.stack(low_groups, dim=0).contiguous(),
+    )
 
 
 @dataclass(frozen=True)
@@ -138,12 +157,16 @@ class TurboQuantMetadata:
     codebook_version: str = TURBOQUANT_CODEBOOK_VERSION
 
     def get_layer(self, layer_name: str) -> TurboQuantLayerMetadata:
-        try:
-            return self.layers[layer_name]
-        except KeyError as e:
-            raise KeyError(
-                f"TurboQuant metadata does not contain layer {layer_name!r}."
-            ) from e
+        candidate_names = _turboquant_layer_name_candidates(layer_name)
+        for candidate_name in candidate_names:
+            layer = self.layers.get(candidate_name)
+            if layer is not None:
+                return layer
+
+        raise KeyError(
+            "TurboQuant metadata does not contain layer "
+            f"{layer_name!r}. Tried aliases: {', '.join(repr(name) for name in candidate_names)}."
+        )
 
     def to_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -313,3 +336,24 @@ def build_default_turboquant_metadata(
         model_name=model_name,
         layers={layer_name: layer_metadata for layer_name in layer_names},
     )
+
+
+def _turboquant_layer_name_candidates(layer_name: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+
+    def add(name: str) -> None:
+        if name not in candidates:
+            candidates.append(name)
+
+    add(layer_name)
+
+    if layer_name.endswith(".attn"):
+        add(layer_name.removesuffix(".attn"))
+
+    if layer_name.startswith("language_model."):
+        stripped = layer_name.removeprefix("language_model.")
+        add(stripped)
+        if stripped.endswith(".attn"):
+            add(stripped.removesuffix(".attn"))
+
+    return tuple(candidates)
